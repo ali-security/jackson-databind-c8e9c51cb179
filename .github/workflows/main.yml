@@ -1,20 +1,18 @@
 name: Build and Deploy Snapshot
 on:
-  push:
-    branches: ['2.*']
-    paths-ignore:
-    - "README.md"
-    - "release-notes/*"
-  pull_request:
-    paths-ignore:
-    - "README.md"
-    - "release-notes/*"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional surefire -Dtest selector (space- or comma-separated); empty runs the full suite'
+        required: false
+        default: ''
 permissions:
   contents: read
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -45,7 +43,44 @@ jobs:
         # gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }} # Value of the GPG private key to import
         # gpg-passphrase: MAVEN_GPG_PASSPHRASE # env variable for GPG private key passphrase
     - name: Build
-      run: ./mvnw -B -ff -ntp verify
+      shell: bash
+      env:
+        FILTER: ${{ inputs.test-filter }}
+      run: |
+        # upstream runs ./mvnw from pwsh on Windows, which resolves to mvnw.cmd
+        MVNW=./mvnw
+        if [ "$RUNNER_OS" = "Windows" ]; then MVNW=./mvnw.cmd; fi
+        if [ -n "$FILTER" ]; then
+          $MVNW -B -ff -ntp verify -Dtest="${FILTER// /,}" -Dsurefire.failIfNoSpecifiedTests=false
+        else
+          $MVNW -B -ff -ntp verify
+        fi
+    - name: Report skipped tests
+      if: always()
+      shell: bash
+      run: |
+        PY=$(command -v python3 || command -v python)
+        "$PY" - <<'PYEOF'
+        import glob, xml.etree.ElementTree as ET
+        total = skipped = 0
+        for f in sorted(glob.glob('target/**/TEST-*.xml', recursive=True)):
+            root = ET.parse(f).getroot()
+            for tc in root.iter('testcase'):
+                total += 1
+                sk = tc.find('skipped')
+                if sk is not None:
+                    skipped += 1
+                    msg = sk.get('message') or (sk.text or '').strip() or 'no message'
+                    print('SKIPPED: %s.%s -- reason: %s' % (tc.get('classname'), tc.get('name'), msg))
+        print('Surefire XML summary: %d testcases, %d skipped' % (total, skipped))
+        PYEOF
+    - name: Upload jar
+      if: ${{ matrix.release_build }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: jackson-databind-jar
+        path: target/jackson-databind-*[0-9].jar
+        if-no-files-found: error
     - name: Extract project Maven version
       id: projectVersion
       if: ${{ !matrix.is_windows }}
@@ -54,7 +89,7 @@ jobs:
       if: ${{ matrix.release_build }}
       run: ./mvnw -B -q -ff -ntp -DskipTests animal-sniffer:check
     - name: Deploy snapshot
-      if: ${{ github.event_name != 'pull_request' && matrix.release_build && endsWith(steps.projectVersion.outputs.version, '-SNAPSHOT') }}
+      if: ${{ false && github.event_name != 'pull_request' && matrix.release_build && endsWith(steps.projectVersion.outputs.version, '-SNAPSHOT') }}
       env:
         CI_DEPLOY_USERNAME: ${{ secrets.CENTRAL_DEPLOY_USERNAME }}
         CI_DEPLOY_PASSWORD: ${{ secrets.CENTRAL_DEPLOY_PASSWORD }}
@@ -64,27 +99,9 @@ jobs:
       if: ${{ github.event_name != 'pull_request' && matrix.release_build }}
       run: ./mvnw -B -q -ff -ntp test
     - name: Publish code coverage
-      if: ${{ github.event_name != 'pull_request' && matrix.release_build }}
+      if: ${{ false && github.event_name != 'pull_request' && matrix.release_build }}
       uses: codecov/codecov-action@e28ff129e5465c2c0dcc6f003fc735cb6ae0c673 # v4.5.0
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         file: ./target/site/jacoco/jacoco.xml
         flags: unittests
-
-  trigger-dep-build-v2:
-    name: Trigger v2 dep builds
-    needs: [build]
-    # Only for pushes to default branch
-    if: ${{ github.event_name == 'push' && github.ref_name == github.event.repository.default_branch }}
-    uses: ./.github/workflows/trigger_dep_builds_v2.yml
-    secrets:
-      token: ${{ secrets.REPO_DISPATCH }}
-
-  trigger-dep-build-v3:
-    name: Trigger v3 dep builds
-    needs: [build]
-    # Only for pushes to default branch
-    if: ${{ github.event_name == 'push' && github.ref_name == 'master' }}
-    uses: ./.github/workflows/trigger_dep_builds_v3.yml
-    secrets:
-      token: ${{ secrets.REPO_DISPATCH }}

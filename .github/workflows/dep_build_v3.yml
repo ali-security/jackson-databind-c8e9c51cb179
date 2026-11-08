@@ -1,7 +1,5 @@
 name: Re-build on jackson-core v3 push
 on:
-  repository_dispatch:
-    types: [jackson-core-pushed-v3]
   # just for testing
   workflow_dispatch:
 
